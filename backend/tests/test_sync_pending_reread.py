@@ -390,6 +390,9 @@ async def test_rekeyed_match_only_promotes_the_rows_that_triggered_the_reread(
     )
     await _sync(session, conn, test_workspace.id, test_user.id, provider)
 
+    old = await _by_external_id(session, "old-pending")
+    assert old is not None
+    assert old.status == "posted"
     await session.refresh(other)
     assert other.status == "pending"
     assert other.external_id == "other-pending"
