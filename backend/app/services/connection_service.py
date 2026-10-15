@@ -1660,12 +1660,14 @@ async def _promote_settled_pending(
     account: Account,
     txn_data,
     incoming_external_ids: set[str],
+    unseen_pending: dict[str, date],
     bills_by_external_id: dict[str, CreditCardBill],
 ) -> None:
     """Mark the pending row a posted `txn_data` settles as posted.
 
     Only for the re-read by date, which also returns rows the user deleted or
-    merged long ago, so this never inserts or merges.
+    merged long ago, so this never inserts or merges. The twin match has no
+    date bound, so only the rows the re-read was issued for are promoted.
     """
     existing = await session.execute(
         select(Transaction)
@@ -1686,6 +1688,7 @@ async def _promote_settled_pending(
         or transaction.source != "sync"
         or transaction.status != "pending"
         or transaction.is_ignored
+        or transaction.external_id not in unseen_pending
     ):
         return
     transaction.status = "posted"
@@ -2537,6 +2540,7 @@ async def sync_connection(
                             account,
                             txn_data,
                             incoming_ids,
+                            unseen_pending,
                             bills_by_external_id,
                         )
 

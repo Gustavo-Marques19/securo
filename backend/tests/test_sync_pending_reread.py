@@ -356,3 +356,40 @@ async def test_promoted_row_survives_phantom_cleanup(
     row = await _by_external_id(session, "old-pending")
     assert row is not None
     assert row.status == "posted"
+
+
+@pytest.mark.parametrize(
+    "days_ago, listed",
+    [
+        (-20, False),  # a scheduled installment, pending by design
+        (120, False),  # outside the re-read window
+        (25, True),  # the regular listing just reported it as still pending
+    ],
+)
+@pytest.mark.asyncio
+async def test_rekeyed_match_only_promotes_the_rows_that_triggered_the_reread(
+    session: AsyncSession, test_user, test_workspace, days_ago, listed,
+):
+    """The twin match behind a re-keyed row has no date bound, so it could
+    reach pending rows the re-read was never issued for."""
+    conn, account = await _setup(session, test_user.id)
+    _add_tx(session, test_user.id, account, "old-pending", 30)
+    other = _add_tx(
+        session, test_user.id, account, "other-pending", days_ago,
+        description="LOOK ALIKE",
+    )
+    await session.commit()
+
+    provider = _provider(
+        listed=[_posted("other-pending", days_ago, description="LOOK ALIKE", status="pending")]
+        if listed else [],
+        reread=[
+            _posted("old-pending", 30),
+            _posted("rekeyed", days_ago, description="LOOK ALIKE"),
+        ],
+    )
+    await _sync(session, conn, test_workspace.id, test_user.id, provider)
+
+    await session.refresh(other)
+    assert other.status == "pending"
+    assert other.external_id == "other-pending"
