@@ -309,3 +309,50 @@ async def test_reread_ids_stay_out_of_phantom_cleanup(
     cleanup.assert_awaited_once()
     live_ids = cleanup.await_args_list[0].args[2]
     assert live_ids == {account_id: {"recent"}}
+
+
+@pytest.mark.asyncio
+async def test_failed_reread_leaves_the_sync_intact(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """The re-read is supplementary: if it fails, the regular listing still
+    lands and the connection stays healthy, instead of every sync failing
+    while the pending row is around."""
+    conn, account = await _setup(session, test_user.id)
+    _add_tx(session, test_user.id, account, "old-pending", 30)
+    conn_id = conn.id
+    await session.commit()
+
+    provider = _provider(listed=[_posted("fresh", 1)])
+    provider.get_transactions_by_date = AsyncMock(side_effect=RuntimeError("Pluggy 500"))
+    await _sync(session, conn, test_workspace.id, test_user.id, provider)
+
+    assert await _by_external_id(session, "fresh") is not None
+    assert (await _by_external_id(session, "old-pending")).status == "pending"
+    connection = await session.get(BankConnection, conn_id)
+    assert connection is not None and connection.status == "active"
+
+
+@pytest.mark.asyncio
+async def test_promoted_row_survives_phantom_cleanup(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """A row the re-read still returns is not a phantom, even next to a paired
+    look-alike that the regular listing returned."""
+    conn, account = await _setup(session, test_user.id)
+    _add_tx(session, test_user.id, account, "old-pending", 30, description="PAGAMENTO")
+    _add_tx(
+        session, test_user.id, account, "paired-twin", 30,
+        description="PAGAMENTO", status="posted", transfer_pair_id=uuid.uuid4(),
+    )
+    await session.commit()
+
+    provider = _provider(
+        listed=[_posted("paired-twin", 30, description="PAGAMENTO")],
+        reread=[_posted("old-pending", 30, description="PAGAMENTO")],
+    )
+    await _sync(session, conn, test_workspace.id, test_user.id, provider)
+
+    row = await _by_external_id(session, "old-pending")
+    assert row is not None
+    assert row.status == "posted"

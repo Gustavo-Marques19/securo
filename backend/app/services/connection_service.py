@@ -34,6 +34,7 @@ from app.providers.base import (
     ProviderRateLimited,
     ProviderUserActionRequired,
     SessionExpiredError,
+    TransactionData,
 )
 from app.services import oauth_state
 from app.services import admin_service
@@ -1696,6 +1697,7 @@ async def _cleanup_phantom_duplicates(
     session: AsyncSession,
     connection_id: uuid.UUID,
     live_external_ids: Optional[dict[uuid.UUID, set[str]]] = None,
+    reread_external_ids: Optional[dict[uuid.UUID, set[str]]] = None,
 ) -> set[uuid.UUID]:
     """Delete synced transactions that are phantom duplicates.
 
@@ -1719,6 +1721,9 @@ async def _cleanup_phantom_duplicates(
     provider's fetch window, so this sync has no evidence about them, and they
     were already checked while they were in it.
 
+    ``reread_external_ids`` holds the ids the pending re-read by date
+    returned. The provider still has those rows, so they are never phantoms.
+
     Returns the ids of the accounts that lost a row, so the caller can
     reconcile their opening balances against what is left.
     """
@@ -1741,6 +1746,7 @@ async def _cleanup_phantom_duplicates(
     touched: set[uuid.UUID] = set()
     for tx in unmatched:
         live = (live_external_ids or {}).get(tx.account_id)
+        reread = (reread_external_ids or {}).get(tx.account_id, set())
         date_lo = tx.date - timedelta(days=1)
         date_hi = tx.date + timedelta(days=1)
         sibling_result = await session.execute(
@@ -1756,6 +1762,8 @@ async def _cleanup_phantom_duplicates(
             )
         )
         for sibling in sibling_result.scalars():
+            if tx.external_id != sibling.external_id and tx.external_id in reread:
+                continue
             if (
                 live is not None
                 and tx.external_id != sibling.external_id
@@ -2100,6 +2108,7 @@ async def sync_connection(
         new_tx_ids: list[uuid.UUID] = []
         merged_count = 0
         live_txn_external_ids: dict[uuid.UUID, set[str]] = {}
+        reread_txn_external_ids: dict[uuid.UUID, set[str]] = {}
         accounts_data = await provider.get_accounts(credentials)
         incoming_external_ids = {acc.external_id for acc in accounts_data}
         incoming_institution_external_ids = frozenset(
@@ -2484,17 +2493,25 @@ async def sync_connection(
                 if since is not None
                 else {}
             )
+            reread: list[TransactionData] = []
             if unseen_pending:
-                reread = await provider.get_transactions_by_date(
-                    credentials,
-                    acc_data.external_id,
-                    min(unseen_pending.values()),
-                    payee_source=payee_source,
-                )
+                try:
+                    reread = await provider.get_transactions_by_date(
+                        credentials,
+                        acc_data.external_id,
+                        min(unseen_pending.values()),
+                        payee_source=payee_source,
+                    )
+                except Exception as e:  # noqa: BLE001 - a failed re-read only delays promotion
+                    logger.warning(
+                        "Skipping pending re-read for account %s: %s", account.id, e
+                    )
+            if reread:
                 # Not added to live_txn_external_ids: a read from an arbitrary date can
                 # return one twin of a pair that straddles it, and the phantom cleanup
                 # would delete the other (#1038).
                 reread_ids = {t.external_id for t in reread}
+                reread_txn_external_ids[account.id] = reread_ids
                 incoming_ids = seen_ids | reread_ids
                 # Skip rows already settled here: only a pending row, or a posted one
                 # under an id we don't have (re-keyed by the provider), can need an update.
@@ -2554,7 +2571,7 @@ async def sync_connection(
         # same payment with different ids. Once transfer detection has paired
         # the real one, the orphan twin gets removed here.
         touched_account_ids = await _cleanup_phantom_duplicates(
-            session, connection.id, live_txn_external_ids
+            session, connection.id, live_txn_external_ids, reread_txn_external_ids
         )
 
         # The opening balances above were reconciled with the phantoms still
