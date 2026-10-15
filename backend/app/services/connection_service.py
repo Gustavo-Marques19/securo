@@ -1602,6 +1602,96 @@ async def _find_synced_duplicate(
     )
 
 
+def _relink_bill(
+    transaction: Transaction,
+    txn_data,
+    account: Account,
+    bills_by_external_id: dict[str, CreditCardBill],
+) -> None:
+    """Point a synced row at the bill the provider says it lands in.
+
+    A manual cycle override (effective_bill_date) wins: bill_id and
+    effective_date stay as the user set them.
+    """
+    if not txn_data.bill_external_id or transaction.effective_bill_date is not None:
+        return
+    bill = bills_by_external_id.get(txn_data.bill_external_id)
+    if bill is not None and transaction.bill_id != bill.id:
+        transaction.bill_id = bill.id
+        apply_effective_date(transaction, account, bill_due_date=bill.due_date)
+
+
+# Card purchases post within a bill cycle or two. A row still pending after
+# this is one the provider keeps pending, and counting it would widen every sync.
+_PENDING_REREAD_WINDOW = timedelta(days=90)
+
+
+async def _unseen_pending_dates(
+    session: AsyncSession,
+    account_id: uuid.UUID,
+    seen_external_ids: set[str],
+) -> dict[str, date]:
+    """Pending synced rows the provider did not return, by external id.
+
+    Future-dated rows are skipped (scheduled installments are pending by
+    design), and so are ignored rows, which sync never changes.
+    """
+    today = app_today()
+    result = await session.execute(
+        select(Transaction.external_id, Transaction.date).where(
+            Transaction.account_id == account_id,
+            Transaction.source == "sync",
+            Transaction.status == "pending",
+            Transaction.is_ignored.is_(False),
+            Transaction.date >= today - _PENDING_REREAD_WINDOW,
+            Transaction.date <= today,
+        )
+    )
+    return {
+        external_id: tx_date
+        for external_id, tx_date in result.all()
+        if external_id not in seen_external_ids
+    }
+
+
+async def _promote_settled_pending(
+    session: AsyncSession,
+    account: Account,
+    txn_data,
+    incoming_external_ids: set[str],
+    bills_by_external_id: dict[str, CreditCardBill],
+) -> None:
+    """Mark the pending row a posted `txn_data` settles as posted.
+
+    Only for the re-read by date, which also returns rows the user deleted or
+    merged long ago, so this never inserts or merges.
+    """
+    existing = await session.execute(
+        select(Transaction)
+        .where(
+            Transaction.account_id == account.id,
+            Transaction.external_id == txn_data.external_id,
+        )
+        .order_by(Transaction.created_at)
+    )
+    transaction = existing.scalars().first()
+    rekeyed = transaction is None
+    if rekeyed:
+        transaction = await _find_synced_duplicate(
+            session, account.id, txn_data, incoming_external_ids
+        )
+    if (
+        transaction is None
+        or transaction.source != "sync"
+        or transaction.status != "pending"
+        or transaction.is_ignored
+    ):
+        return
+    transaction.status = "posted"
+    _merge_sync_metadata(transaction, txn_data, replace_external_id=rekeyed)
+    _relink_bill(transaction, txn_data, account, bills_by_external_id)
+
+
 async def _cleanup_phantom_duplicates(
     session: AsyncSession,
     connection_id: uuid.UUID,
@@ -2144,10 +2234,11 @@ async def sync_connection(
             )
 
             # Fetch and sync transactions. The 14-day rewind is on Pluggy's
-            # `createdAt` (when their row was inserted), so it covers two
-            # cases: (1) PENDING transactions that POSTED since last sync,
-            # (2) any rows Pluggy ingested late but backdated. Dedup on
-            # external_id below handles overlap cheaply.
+            # `createdAt` (when their row was inserted), so it picks up rows
+            # Pluggy ingested late but backdated. A row keeps its `createdAt`
+            # when it posts, so pending rows older than the window are
+            # re-read by date after this loop. Dedup on external_id below
+            # handles overlap cheaply.
             since = (
                 connection.last_sync_at.date() - timedelta(days=14)
                 if connection.last_sync_at
@@ -2197,20 +2288,7 @@ async def sync_connection(
                     # first sync after the bill becomes available. Same
                     # branch covers re-bucketing if the bank moved a tx to
                     # a different bill (e.g. a chargeback).
-                    #
-                    # User's manual override wins: if effective_bill_date is
-                    # set, we don't touch bill_id or effective_date — the
-                    # user has explicitly overridden the auto bucketing.
-                    if (
-                        txn_data.bill_external_id
-                        and existing_tx.effective_bill_date is None
-                    ):
-                        bill = bills_by_external_id.get(txn_data.bill_external_id)
-                        if bill is not None and existing_tx.bill_id != bill.id:
-                            existing_tx.bill_id = bill.id
-                            apply_effective_date(
-                                existing_tx, account, bill_due_date=bill.due_date
-                            )
+                    _relink_bill(existing_tx, txn_data, account, bills_by_external_id)
                     continue
 
                 # Pass 2: Fuzzy match against manual transactions
@@ -2243,16 +2321,7 @@ async def sync_connection(
                             txn_data,
                             replace_external_id=synced_dup.source == "sync",
                         )
-                        if (
-                            txn_data.bill_external_id
-                            and synced_dup.effective_bill_date is None
-                        ):
-                            bill = bills_by_external_id.get(txn_data.bill_external_id)
-                            if bill is not None and synced_dup.bill_id != bill.id:
-                                synced_dup.bill_id = bill.id
-                                apply_effective_date(
-                                    synced_dup, account, bill_due_date=bill.due_date
-                                )
+                        _relink_bill(synced_dup, txn_data, account, bills_by_external_id)
                     elif synced_dup.external_id != txn_data.external_id:
                         # Same logical posted row re-keyed by a provider such
                         # as SimpleFIN. Keep the user's row and move its
@@ -2406,6 +2475,53 @@ async def sync_connection(
                     transaction.fx_rate_used = txn_data.amount_in_account_currency / txn_data.amount
                 else:
                     await stamp_primary_amount(session, user_id, transaction)
+
+            # Re-read by date the pending rows the listing above no longer returns.
+            # The first sync lists everything, so it never needs this.
+            seen_ids = live_txn_external_ids[account.id]
+            unseen_pending = (
+                await _unseen_pending_dates(session, account.id, seen_ids)
+                if since is not None
+                else {}
+            )
+            if unseen_pending:
+                reread = await provider.get_transactions_by_date(
+                    credentials,
+                    acc_data.external_id,
+                    min(unseen_pending.values()),
+                    payee_source=payee_source,
+                )
+                # Not added to live_txn_external_ids: a read from an arbitrary date can
+                # return one twin of a pair that straddles it, and the phantom cleanup
+                # would delete the other (#1038).
+                reread_ids = {t.external_id for t in reread}
+                incoming_ids = seen_ids | reread_ids
+                # Skip rows already settled here: only a pending row, or a posted one
+                # under an id we don't have (re-keyed by the provider), can need an update.
+                known_ids = set(
+                    (
+                        await session.execute(
+                            select(Transaction.external_id).where(
+                                Transaction.account_id == account.id,
+                                Transaction.external_id.in_(reread_ids),
+                            )
+                        )
+                    ).scalars()
+                )
+                for txn_data in reread:
+                    if txn_data.status != "posted" or txn_data.external_id in seen_ids:
+                        continue
+                    if (
+                        txn_data.external_id in unseen_pending
+                        or txn_data.external_id not in known_ids
+                    ):
+                        await _promote_settled_pending(
+                            session,
+                            account,
+                            txn_data,
+                            incoming_ids,
+                            bills_by_external_id,
+                        )
 
             # Reconcile the opening balance after any new transactions land so
             # SUM(all txs) keeps matching account.balance from the provider.
