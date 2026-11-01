@@ -643,11 +643,13 @@ async def get_summary(
             forecast_converted, _ = await convert(
                 session, Decimal(str(tx.amount)), tx.currency, primary_currency,
             )
-        forecast_converted *= forecast_fractions.get(tx.id, 1)
+        # Magnitude first: the owner's share can be negative, and abs() after
+        # the fraction would flip it.
+        forecast_converted = abs(forecast_converted) * forecast_fractions.get(tx.id, 1)
         if tx.type == "credit":
-            projected_income_primary += abs(float(forecast_converted))
+            projected_income_primary += float(forecast_converted)
         else:
-            projected_expenses_primary += abs(float(forecast_converted))
+            projected_expenses_primary += float(forecast_converted)
 
     # Aggregate the user's net pending balance across all groups they
     # participate in. We reuse the group balance computation so partial

@@ -843,12 +843,14 @@ async def test_monthly_trend_uses_owner_share_of_pending_row(
     assert trend[-1].expenses == pytest.approx(45.0, abs=0.01)
 
 
+@pytest.mark.parametrize("my_share, friend_share", [("120.00", "-20.00"), ("-20.00", "120.00")])
 @pytest.mark.asyncio
 async def test_summary_projection_keeps_the_sign_of_exact_shares(
-    session: AsyncSession, test_user, test_workspace
+    session: AsyncSession, test_user, test_workspace, my_share, friend_share
 ):
-    """An exact split may give a friend a negative share. The projection
-    follows the posted offset and counts the owner's $120, not $80."""
+    """An exact split may give a member a negative share. The projection
+    follows the posted offset and counts the owner's share with its sign:
+    $120 rather than $80, and -$20 rather than $0 or +$20."""
     await _force_user_currency(session, test_user, "USD")
     today = date.today()
     account = await _make_account(session, test_user.id)
@@ -864,8 +866,8 @@ async def test_summary_projection_keeps_the_sign_of_exact_shares(
         TransactionSplitsInput(
             share_type="exact",
             splits=[
-                TransactionSplitInput(group_member_id=me.id, share_amount=Decimal("120.00")),
-                TransactionSplitInput(group_member_id=friend.id, share_amount=Decimal("-20.00")),
+                TransactionSplitInput(group_member_id=me.id, share_amount=Decimal(my_share)),
+                TransactionSplitInput(group_member_id=friend.id, share_amount=Decimal(friend_share)),
             ],
         ),
         test_user.id,
@@ -875,4 +877,4 @@ async def test_summary_projection_keeps_the_sign_of_exact_shares(
     summary = await dashboard_service.get_summary(
         session, test_workspace.id, test_user.id, today.replace(day=1)
     )
-    assert summary.projected_expenses_primary == pytest.approx(120.0, abs=0.01)
+    assert summary.projected_expenses_primary == pytest.approx(float(my_share), abs=0.01)
