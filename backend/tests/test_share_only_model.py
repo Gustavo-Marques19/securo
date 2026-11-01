@@ -641,3 +641,202 @@ async def test_budget_actual_uses_share_only(
     food_row = next(r for r in rows if r.category_id == food.id)
     # Owner's share is $20 (60/3); the full $60 would be the bug.
     assert float(food_row.actual_amount) == pytest.approx(20.0, abs=0.01)
+
+
+# ──────────── share-only model: pending and future-dated rows ─────────────
+
+
+def _next_month(d: date) -> date:
+    return _month_window(d)[1]
+
+
+async def _split_half_with_friend(session, test_user, test_workspace, tx) -> None:
+    _, members = await _setup_group(
+        session, test_user, test_workspace.id, "Me", "Friend"
+    )
+    half = (tx.amount / 2).quantize(Decimal("0.01"))
+    await split_service.replace_splits(
+        session,
+        tx,
+        TransactionSplitsInput(
+            share_type="exact",
+            splits=[
+                TransactionSplitInput(group_member_id=m.id, share_amount=half)
+                for m in members
+            ],
+        ),
+        test_user.id,
+    )
+
+
+@pytest.mark.asyncio
+async def test_summary_projection_uses_owner_share_of_pending_row(
+    session: AsyncSession, test_user, test_workspace
+):
+    """A pending $150 card purchase split three ways projects $50, the same
+    as it will count once it posts."""
+    await _force_user_currency(session, test_user, "USD")
+    today = date.today()
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(session, test_user.id, account.id, "150.00", when=today)
+    tx.status = "pending"
+    _, members = await _setup_group(
+        session, test_user, test_workspace.id, "Me", "A", "B"
+    )
+    await split_service.replace_splits(
+        session,
+        tx,
+        TransactionSplitsInput(
+            share_type="equal",
+            splits=[TransactionSplitInput(group_member_id=m.id) for m in members],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+
+    summary = await dashboard_service.get_summary(
+        session, test_workspace.id, test_user.id, today.replace(day=1)
+    )
+    assert summary.monthly_expenses_primary == pytest.approx(0.0, abs=0.01)
+    assert summary.projected_expenses == pytest.approx(50.0, abs=0.01)
+    assert summary.projected_expenses_primary == pytest.approx(50.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_summary_projection_drops_pending_row_owed_in_full(
+    session: AsyncSession, test_user, test_workspace
+):
+    """A pending row split entirely to a friend adds nothing to the
+    owner's projection."""
+    await _force_user_currency(session, test_user, "USD")
+    today = date.today()
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(session, test_user.id, account.id, "80.00", when=today)
+    tx.status = "pending"
+    _, members = await _setup_group(
+        session, test_user, test_workspace.id, "Me", "Friend"
+    )
+    me, friend = members
+    await split_service.replace_splits(
+        session,
+        tx,
+        TransactionSplitsInput(
+            share_type="exact",
+            splits=[
+                TransactionSplitInput(group_member_id=me.id, share_amount=Decimal("0")),
+                TransactionSplitInput(group_member_id=friend.id, share_amount=Decimal("80.00")),
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+
+    summary = await dashboard_service.get_summary(
+        session, test_workspace.id, test_user.id, today.replace(day=1)
+    )
+    assert summary.projected_expenses_primary == pytest.approx(0.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_spending_by_category_projection_uses_owner_share(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    """A pending categorized split projects only the owner's share into its
+    category, and an account filter keeps the full amount, as it does for
+    posted rows."""
+    await _force_user_currency(session, test_user, "USD")
+    today = date.today()
+    food = test_categories[0]
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(
+        session, test_user.id, account.id, "50.00", category_id=food.id, when=today
+    )
+    tx.status = "pending"
+    await _split_half_with_friend(session, test_user, test_workspace, tx)
+    await session.commit()
+
+    spending = await dashboard_service.get_spending_by_category(
+        session, test_workspace.id, test_user.id, today.replace(day=1)
+    )
+    food_row = next(s for s in spending if s.category_name == "Alimentação")
+    assert food_row.projected_total == pytest.approx(25.0, abs=0.01)
+
+    filtered = await dashboard_service.get_spending_by_category(
+        session, test_workspace.id, test_user.id, today.replace(day=1),
+        account_ids=[account.id],
+    )
+    food_row = next(s for s in filtered if s.category_name == "Alimentação")
+    assert food_row.projected_total == pytest.approx(50.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_budget_projection_uses_owner_share_of_future_installment(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    """Next month's $300 installment, split half with a friend, projects
+    $150 against next month's budget."""
+    await _force_user_currency(session, test_user, "USD")
+    next_month = _next_month(date.today())
+    food = test_categories[0]
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(
+        session,
+        test_user.id,
+        account.id,
+        "300.00",
+        category_id=food.id,
+        when=next_month.replace(day=10),
+    )
+    await _split_half_with_friend(session, test_user, test_workspace, tx)
+
+    from app.models.budget import Budget
+
+    session.add(
+        Budget(
+            id=uuid.uuid4(),
+            user_id=test_user.id,
+            category_id=food.id,
+            amount=Decimal("200.00"),
+            currency="USD",
+            month=next_month,
+            is_recurring=True,
+        )
+    )
+    await session.commit()
+
+    rows = await budget_service.get_budget_vs_actual(
+        session, test_workspace.id, test_user.id, next_month
+    )
+    food_row = next(r for r in rows if r.category_id == food.id)
+    assert float(food_row.actual_amount) == pytest.approx(0.0, abs=0.01)
+    # The full $300 would put the category over its $200 budget.
+    assert float(food_row.projected_amount) == pytest.approx(150.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_monthly_trend_uses_owner_share_of_pending_row(
+    session: AsyncSession, test_user, test_workspace
+):
+    """The current month of the trend counts a pending split at the owner's
+    share."""
+    await _force_user_currency(session, test_user, "USD")
+    today = date.today()
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(session, test_user.id, account.id, "90.00", when=today)
+    tx.status = "pending"
+    await _split_half_with_friend(session, test_user, test_workspace, tx)
+    await session.commit()
+
+    # get_monthly_trend groups with Postgres' to_char; SQLite needs a stand-in.
+    raw = await session.connection()
+    await raw.run_sync(
+        lambda conn: conn.connection.dbapi_connection.create_function(
+            "to_char", 2, lambda value, _fmt: None if value is None else str(value)[:7]
+        )
+    )
+
+    trend = await dashboard_service.get_monthly_trend(
+        session, test_workspace.id, test_user.id, months=1
+    )
+    assert trend[-1].month == today.strftime("%Y-%m")
+    assert trend[-1].expenses == pytest.approx(45.0, abs=0.01)
