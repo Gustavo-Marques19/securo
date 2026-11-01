@@ -396,3 +396,47 @@ async def test_rekeyed_match_only_promotes_the_rows_that_triggered_the_reread(
     await session.refresh(other)
     assert other.status == "pending"
     assert other.external_id == "other-pending"
+
+
+@pytest.mark.asyncio
+async def test_rekeyed_twin_the_reread_also_returns_is_still_a_phantom(
+    session: AsyncSession, test_user, test_workspace,
+):
+    """Pluggy can keep a stale pending record next to the posted one it
+    re-keyed. The posted twin the regular listing brings in is a phantom of
+    the paired row already here, even though the re-read returns it too: the
+    re-read only vouches for the rows it promoted."""
+    conn, account = await _setup(session, test_user.id)
+    _add_tx(session, test_user.id, account, "old-pending", 30)
+    _add_tx(
+        session, test_user.id, account, "payment", 21,
+        description="PAGAMENTO RECEBIDO", type="credit", amount=Decimal("7815.59"),
+        status="posted", transfer_pair_id=uuid.uuid4(),
+    )
+    account_id = account.id
+    await session.commit()
+
+    rekeyed = _posted(
+        "payment-rekeyed", 21, description="PAGAMENTO RECEBIDO", amount=Decimal("7815.59"),
+    )
+    rekeyed.type = "credit"
+    stale = _posted(
+        "payment", 21, description="PAGAMENTO RECEBIDO", amount=Decimal("7815.59"),
+        status="pending",
+    )
+    stale.type = "credit"
+    provider = _provider(
+        listed=[rekeyed],
+        reread=[_posted("old-pending", 30), stale, rekeyed],
+    )
+    await _sync(session, conn, test_workspace.id, test_user.id, provider)
+
+    assert (await _by_external_id(session, "old-pending")).status == "posted"
+    assert await _by_external_id(session, "payment-rekeyed") is None
+    payments = (await session.execute(
+        select(func.count()).select_from(Transaction).where(
+            Transaction.account_id == account_id,
+            Transaction.amount == Decimal("7815.59"),
+        )
+    )).scalar_one()
+    assert payments == 1

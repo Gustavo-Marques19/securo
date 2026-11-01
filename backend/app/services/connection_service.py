@@ -1969,12 +1969,14 @@ async def _promote_settled_pending(
     incoming_external_ids: set[str],
     unseen_pending: dict[str, date],
     bills_by_external_id: dict[str, CreditCardBill],
-) -> None:
+) -> Optional[str]:
     """Mark the pending row a posted `txn_data` settles as posted.
 
     Only for the re-read by date, which also returns rows the user deleted or
     merged long ago, so this never inserts or merges. The twin match has no
     date bound, so only the rows the re-read was issued for are promoted.
+
+    Returns the promoted row's external id, or None when nothing changed.
     """
     existing = await session.execute(
         select(Transaction)
@@ -1997,10 +1999,11 @@ async def _promote_settled_pending(
         or transaction.is_ignored
         or transaction.external_id not in unseen_pending
     ):
-        return
+        return None
     transaction.status = "posted"
     _merge_sync_metadata(transaction, txn_data, replace_external_id=rekeyed)
     _relink_bill(transaction, txn_data, account, bills_by_external_id)
+    return transaction.external_id
 
 
 async def _cleanup_phantom_duplicates(
@@ -2008,7 +2011,7 @@ async def _cleanup_phantom_duplicates(
     connection_id: uuid.UUID,
     live_external_ids: Optional[dict[uuid.UUID, set[str]]] = None,
     skip_account_ids: Optional[set[uuid.UUID]] = None,
-    reread_external_ids: Optional[dict[uuid.UUID, set[str]]] = None,
+    promoted_external_ids: Optional[dict[uuid.UUID, set[str]]] = None,
 ) -> set[uuid.UUID]:
     """Delete synced transactions that are phantom duplicates.
 
@@ -2037,8 +2040,12 @@ async def _cleanup_phantom_duplicates(
     so a row from the missing part would look like a re-keyed twin of a
     returned sibling; they are left alone until a complete fetch.
 
-    ``reread_external_ids`` holds the ids the pending re-read by date
-    returned. The provider still has those rows, so they are never phantoms.
+    ``promoted_external_ids`` holds the ids of the rows the pending re-read
+    promoted in this sync. The provider just reported them as posted, so they
+    are never phantoms. The other rows the re-read returns get no such pass:
+    a provider can keep a stale pending record next to the posted one it
+    re-keyed, and the posted twin the regular listing inserted is still a
+    phantom of the row already here.
 
     Returns the ids of the accounts that lost a row, so the caller can
     reconcile their opening balances against what is left.
@@ -2065,7 +2072,7 @@ async def _cleanup_phantom_duplicates(
     touched: set[uuid.UUID] = set()
     for tx in unmatched:
         live = (live_external_ids or {}).get(tx.account_id)
-        reread = (reread_external_ids or {}).get(tx.account_id, set())
+        promoted = (promoted_external_ids or {}).get(tx.account_id, set())
         date_lo = tx.date - timedelta(days=1)
         date_hi = tx.date + timedelta(days=1)
         sibling_result = await session.execute(
@@ -2081,7 +2088,7 @@ async def _cleanup_phantom_duplicates(
             )
         )
         for sibling in sibling_result.scalars():
-            if tx.external_id != sibling.external_id and tx.external_id in reread:
+            if tx.external_id != sibling.external_id and tx.external_id in promoted:
                 continue
             if (
                 live is not None
@@ -2439,7 +2446,7 @@ async def sync_connection(
         merged_count = 0
         live_txn_external_ids: dict[uuid.UUID, set[str]] = {}
         incomplete_fetch_account_ids: set[uuid.UUID] = set()
-        reread_txn_external_ids: dict[uuid.UUID, set[str]] = {}
+        promoted_txn_external_ids: dict[uuid.UUID, set[str]] = {}
         accounts_data = await provider.get_accounts(credentials)
         incoming_external_ids = {acc.external_id for acc in accounts_data}
         incoming_institution_external_ids = frozenset(
@@ -2872,7 +2879,7 @@ async def sync_connection(
                 # return one twin of a pair that straddles it, and the phantom cleanup
                 # would delete the other (#1038).
                 reread_ids = {t.external_id for t in reread}
-                reread_txn_external_ids[account.id] = reread_ids
+                promoted_ids = promoted_txn_external_ids.setdefault(account.id, set())
                 incoming_ids = seen_ids | reread_ids
                 # Skip rows already settled here: only a pending row, or a posted one
                 # under an id we don't have (re-keyed by the provider), can need an update.
@@ -2893,7 +2900,7 @@ async def sync_connection(
                         txn_data.external_id in unseen_pending
                         or txn_data.external_id not in known_ids
                     ):
-                        await _promote_settled_pending(
+                        promoted_id = await _promote_settled_pending(
                             session,
                             account,
                             txn_data,
@@ -2901,6 +2908,8 @@ async def sync_connection(
                             unseen_pending,
                             bills_by_external_id,
                         )
+                        if promoted_id:
+                            promoted_ids.add(promoted_id)
 
             # Reconcile the opening balance after any new transactions land so
             # SUM(all txs) keeps matching account.balance from the provider.
@@ -2934,7 +2943,7 @@ async def sync_connection(
         # the real one, the orphan twin gets removed here.
         touched_account_ids = await _cleanup_phantom_duplicates(
             session, connection.id, live_txn_external_ids,
-            reread_external_ids=reread_txn_external_ids,
+            promoted_external_ids=promoted_txn_external_ids,
             skip_account_ids=incomplete_fetch_account_ids,
         )
 
