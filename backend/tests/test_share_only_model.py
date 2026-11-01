@@ -841,3 +841,38 @@ async def test_monthly_trend_uses_owner_share_of_pending_row(
     )
     assert trend[-1].month == today.strftime("%Y-%m")
     assert trend[-1].expenses == pytest.approx(45.0, abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_summary_projection_keeps_the_sign_of_exact_shares(
+    session: AsyncSession, test_user, test_workspace
+):
+    """An exact split may give a friend a negative share. The projection
+    follows the posted offset and counts the owner's $120, not $80."""
+    await _force_user_currency(session, test_user, "USD")
+    today = date.today()
+    account = await _make_account(session, test_user.id)
+    tx = await _make_tx(session, test_user.id, account.id, "100.00", when=today)
+    tx.status = "pending"
+    _, members = await _setup_group(
+        session, test_user, test_workspace.id, "Me", "Friend"
+    )
+    me, friend = members
+    await split_service.replace_splits(
+        session,
+        tx,
+        TransactionSplitsInput(
+            share_type="exact",
+            splits=[
+                TransactionSplitInput(group_member_id=me.id, share_amount=Decimal("120.00")),
+                TransactionSplitInput(group_member_id=friend.id, share_amount=Decimal("-20.00")),
+            ],
+        ),
+        test_user.id,
+    )
+    await session.commit()
+
+    summary = await dashboard_service.get_summary(
+        session, test_workspace.id, test_user.id, today.replace(day=1)
+    )
+    assert summary.projected_expenses_primary == pytest.approx(120.0, abs=0.01)

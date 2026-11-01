@@ -498,7 +498,10 @@ async def forecast_owner_share_fractions(
         full = abs(Decimal(str(own_rows[tx_id].amount)))
         if not full:
             continue
-        fractions[tx_id] = max(Decimal("0"), 1 - abs(Decimal(str(others or 0))) / full)
+        # Signed and unclamped, like the posted offset: an exact split may
+        # give a member a negative share, and the owner's share then exceeds
+        # the row.
+        fractions[tx_id] = 1 - Decimal(str(others or 0)) / full
     return fractions
 
 
