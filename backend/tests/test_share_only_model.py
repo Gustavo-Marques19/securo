@@ -828,12 +828,13 @@ async def test_monthly_trend_uses_owner_share_of_pending_row(
     await session.commit()
 
     # get_monthly_trend groups with Postgres' to_char; SQLite needs a stand-in.
-    raw = await session.connection()
-    await raw.run_sync(
-        lambda conn: conn.connection.dbapi_connection.create_function(
+    def _install_to_char(dbapi_conn):
+        dbapi_conn.create_function(
             "to_char", 2, lambda value, _fmt: None if value is None else str(value)[:7]
         )
-    )
+
+    raw = await session.connection()
+    await raw.run_sync(lambda conn: _install_to_char(conn.connection.dbapi_connection))
 
     trend = await dashboard_service.get_monthly_trend(
         session, test_workspace.id, test_user.id, months=1
