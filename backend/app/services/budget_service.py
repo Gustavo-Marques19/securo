@@ -371,6 +371,11 @@ async def get_budget_vs_actual(
             )
         converted *= forecast_fractions.get(tx.id, 1)
         projected_spending_map[cat_id] = projected_spending_map.get(cat_id, Decimal("0")) + converted
+    # A negative owner share can pull a category below zero; like posted
+    # spending, a category that ends up nonpositive drops out.
+    for cat_id, total in list(projected_spending_map.items()):
+        if total <= 0:
+            del projected_spending_map[cat_id]
 
     # Get previous month spending by category (exclude transfer pairs)
     # Net spending = Debits - Credits (refunds offset expenses)
@@ -464,6 +469,11 @@ async def get_budget_vs_actual(
             )
         converted *= prev_forecast_fractions.get(tx.id, 1)
         projected_prev_spending_map[cat_id] = projected_prev_spending_map.get(cat_id, Decimal("0")) + converted
+    # A negative owner share can pull a category below zero; like posted
+    # spending, a category that ends up nonpositive drops out.
+    for cat_id, total in list(projected_prev_spending_map.items()):
+        if total <= 0:
+            del projected_prev_spending_map[cat_id]
 
     comparisons = []
     for category, group in all_categories:

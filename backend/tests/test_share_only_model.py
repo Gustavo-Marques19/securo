@@ -878,3 +878,69 @@ async def test_summary_projection_keeps_the_sign_of_exact_shares(
         session, test_workspace.id, test_user.id, today.replace(day=1)
     )
     assert summary.projected_expenses_primary == pytest.approx(float(my_share), abs=0.01)
+
+
+@pytest.mark.asyncio
+async def test_negative_owner_forecast_reduces_but_never_inverts_a_category(
+    session: AsyncSession, test_user, test_workspace, test_categories
+):
+    """A pending row where the owner's share is -$20 lowers a category with
+    $50 posted to $30 projected. A category with only that row projects
+    nothing instead of a negative amount, as posted spending would."""
+    await _force_user_currency(session, test_user, "USD")
+    today = date.today()
+    food, transport = test_categories[0], test_categories[1]
+    account = await _make_account(session, test_user.id)
+    await _make_tx(session, test_user.id, account.id, "50.00", category_id=food.id, when=today)
+    _, members = await _setup_group(
+        session, test_user, test_workspace.id, "Me", "Friend"
+    )
+    me, friend = members
+    for category in (food, transport):
+        tx = await _make_tx(
+            session, test_user.id, account.id, "100.00", category_id=category.id, when=today
+        )
+        tx.status = "pending"
+        await split_service.replace_splits(
+            session,
+            tx,
+            TransactionSplitsInput(
+                share_type="exact",
+                splits=[
+                    TransactionSplitInput(group_member_id=me.id, share_amount=Decimal("-20.00")),
+                    TransactionSplitInput(group_member_id=friend.id, share_amount=Decimal("120.00")),
+                ],
+            ),
+            test_user.id,
+        )
+
+    from app.models.budget import Budget
+
+    for category in (food, transport):
+        session.add(
+            Budget(
+                id=uuid.uuid4(),
+                user_id=test_user.id,
+                category_id=category.id,
+                amount=Decimal("100.00"),
+                currency="USD",
+                month=today.replace(day=1),
+                is_recurring=True,
+            )
+        )
+    await session.commit()
+
+    spending = await dashboard_service.get_spending_by_category(
+        session, test_workspace.id, test_user.id, today.replace(day=1)
+    )
+    by_name = {s.category_name: s for s in spending}
+    assert by_name["Alimentação"].total == pytest.approx(50.0, abs=0.01)
+    assert by_name["Alimentação"].projected_total == pytest.approx(30.0, abs=0.01)
+    assert "Transporte" not in by_name
+
+    rows = await budget_service.get_budget_vs_actual(
+        session, test_workspace.id, test_user.id, today.replace(day=1)
+    )
+    by_id = {r.category_id: r for r in rows}
+    assert float(by_id[food.id].projected_amount) == pytest.approx(30.0, abs=0.01)
+    assert float(by_id[transport.id].projected_amount) == pytest.approx(0.0, abs=0.01)
